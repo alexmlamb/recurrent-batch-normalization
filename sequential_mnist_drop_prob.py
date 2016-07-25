@@ -71,17 +71,22 @@ def get_stream_(which_set, batch_size, num_examples=None):
     return stream
 
 class SampleDrops2(Transformer):
-    def __init__(self, data_stream, drop_prob,
+    def __init__(self, data_stream,
+                 drop_prob_state,
+                 drop_prob_cell,
                  hidden_dim, is_for_test, permutation,
                  drop_law = "constant",
+                 shared=False,
                  **kwargs):
         super(SampleDrops2, self).__init__(
             data_stream, **kwargs)
-        self.drop_prob = drop_prob
+        self.drop_prob_state = drop_prob_state
+        self.drop_prob_cell = drop_prob_cell
         self.hidden_dim = hidden_dim
         self.is_for_test = is_for_test
         self.produces_examples = False
         self.permutation = permutation
+        self.shared = shared
 
     def get_data(self, request=None):
         data = next(self.child_epoch_iterator)
@@ -92,15 +97,24 @@ class SampleDrops2(Transformer):
         transformed_data.append(data[1][:, 0])
         T, B, _ = transformed_data[0].shape
         if self.is_for_test:
-            drops = np.ones((T, B, self.hidden_dim)) * self.drop_prob
+            drops_state = np.ones((T, B, self.hidden_dim)) * self.drop_prob_state
+            drops_cell = np.ones((T, B, self.hidden_dim)) * self.drop_prob_cell
         else:
-            drops = np.random.binomial(n=1, p=self.drop_prob,
-                                       size=(T, B, self.hidden_dim))
-        transformed_data.append(drops.astype(floatX))
+            drops_state = np.random.binomial(n=1, p=self.drop_prob_state,
+                                             size=(T, B, self.hidden_dim))
+            drops_cell = np.random.binomial(n=1, p=self.drop_prob_cell,
+                                             size=(T, B, self.hidden_dim))
+        transformed_data.append(drops_state.astype(floatX))
+        if self.shared:
+            transformed_data.append(drops_state.astype(floatX))
+        else:
+            transformed_data.append(drops_cell.astype(floatX))
         return transformed_data
 
-def get_stream(which_set, batch_size, drop_prob,
+def get_stream(which_set, batch_size,
+               drop_prob_state, drop_prob_cell,
                hidden_dim, for_evaluation,
+               shared_mask=False,
                num_examples=None):
     np.random.seed(seed=1)
     permutation = np.random.randint(0, 784, size=(784,))
@@ -111,10 +125,10 @@ def get_stream(which_set, batch_size, drop_prob,
         dataset,
         iteration_scheme=fuel.schemes.ShuffledScheme(num_examples, batch_size))
     if which_set == "train":
-        ds = SampleDrops2(stream, drop_prob, hidden_dim, for_evaluation, permutation)
+        ds = SampleDrops2(stream, drop_prob_state, drop_prob_cell, hidden_dim, for_evaluation, permutation, shared=shared_mask)
     else:
-        ds = SampleDrops2(stream, drop_prob, hidden_dim, for_evaluation, permutation)
-    ds.sources = ('x', 'y', 'drops')
+        ds = SampleDrops2(stream, drop_prob_state, drop_prob_cell, hidden_dim, for_evaluation, permutation, shared=shared_mask)
+    ds.sources = ('x', 'y', 'drops_state', 'drops_cell')
     return ds
 
 
@@ -195,12 +209,14 @@ class LSTM(object):
 
         return self.parameters
 
-    def construct_graph_popstats(self, args, x, drops,
+    def construct_graph_popstats(self, args, x,
+                                 drops_state, drops_cell,
                                  length, popstats=None):
         p = self.allocate_parameters(args)
 
 
-        def stepfn(x, drops,
+        def stepfn(x,
+                   drops_state, drops_cell,
                    dummy_h, dummy_c,
                    pop_means_a, pop_means_b, pop_means_c,
                    pop_vars_a, pop_vars_b, pop_vars_c,
@@ -219,25 +235,32 @@ class LSTM(object):
                           for j, fn in enumerate([self.activation] + 3 * [T.nnet.sigmoid])]
 
             if args.elephant:
-                c_n = dummy_c + f * c + drops * (i * g)
+                c_n = dummy_c + f * c + drops_cell * (i * g)
             else:
                 c_n = dummy_c + f * c + i * g
+
+            if args.zoneout:
+                c_n_z = c_n * drops_cell + (1 - drops_cell) * c
+            else:
+                c_n_z = c_n
+
             if args.baseline:
                 c_normal, c_mean, c_var = bn(c_n, 1.0, p.c_betas, pop_means_c, pop_vars_c, args)
             else:
                 c_normal, c_mean, c_var = bn(c_n, p.c_gammas, p.c_betas, pop_means_c, pop_vars_c, args)
+
             h_n = dummy_h + o * self.activation(c_normal)
 
 
             ## Zoneout
             if args.zoneout:
-                h = h_n * drops + (1 - drops) * h
-                c = c_n * drops + (1 - drops) * c
+                h = h_n * drops_state + (1 - drops_state) * h
+                c = c_n_z
             else:
                 h = h_n
                 c = c_n
 
-            return (h, c, atilde, btilde, c_normal,
+            return (h, c, atilde, btilde, c,
                    a_mean, b_mean, c_mean,
                     a_var, b_var, c_var)
 
@@ -271,7 +294,7 @@ class LSTM(object):
          batch_mean_a, batch_mean_b, batch_mean_c,
          batch_var_a, batch_var_b, batch_var_c ], _ = theano.scan(
              stepfn,
-             sequences=[xtilde, drops, dummy_states["h"], dummy_states["c"]] + popstats_seq,
+             sequences=[xtilde, drops_cell, drops_state, dummy_states["h"], dummy_states["c"]] + popstats_seq,
              outputs_info=[T.repeat(p.h0[None, :], xtilde.shape[1], axis=0) + h_prime,
                            T.repeat(p.c0[None, :], xtilde.shape[1], axis=0),
                            None, None, None,
@@ -292,11 +315,114 @@ class LSTM(object):
             for key in "abc":
                 for stat, init in zip("mean var".split(), [0, 1]):
                     name = "%s_%s" % (key, stat)
+                    print name
                     popstats[name].tag.estimand = batchstats[name]
                     updates[popstats[name]] = (alpha * batchstats[name] +
                                                (1 - alpha) * popstats[name])
-        return dict(h=h, c=c,
-                    atilde=atilde, btilde=btilde, htilde=htilde), updates, dummy_states, popstats
+        return dict(h=h, c=c), updates, dummy_states, popstats
+
+    # def construct_graph_popstats(self, args, x, drops,
+    #                              length, popstats=None):
+    #     p = self.allocate_parameters(args)
+
+
+    #     def stepfn(x, drops,
+    #                dummy_h, dummy_c,
+    #                pop_means_a, pop_means_b, pop_means_c,
+    #                pop_vars_a, pop_vars_b, pop_vars_c,
+    #                h, c):
+
+    #         atilde = T.dot(h, p.Wa)
+    #         btilde = x
+    #         if args.baseline:
+    #             a_normal, a_mean, a_var = bn(atilde, 1.0, p.ab_betas, pop_means_a, pop_vars_a, args)
+    #             b_normal, b_mean, b_var = bn(btilde, 1.0, 0,          pop_means_b, pop_vars_b, args)
+    #         else:
+    #             a_normal, a_mean, a_var = bn(atilde, p.a_gammas, p.ab_betas, pop_means_a, pop_vars_a, args)
+    #             b_normal, b_mean, b_var = bn(btilde, p.b_gammas, 0,          pop_means_b, pop_vars_b, args)
+    #         ab = a_normal + b_normal
+    #         g, f, i, o = [fn(ab[:, j * args.num_hidden:(j + 1) * args.num_hidden])
+    #                       for j, fn in enumerate([self.activation] + 3 * [T.nnet.sigmoid])]
+
+    #         if args.elephant:
+    #             c_n = dummy_c + f * c + drops * (i * g)
+    #         else:
+    #             c_n = dummy_c + f * c + i * g
+    #         if args.baseline:
+    #             c_normal, c_mean, c_var = bn(c_n, 1.0, p.c_betas, pop_means_c, pop_vars_c, args)
+    #         else:
+    #             c_normal, c_mean, c_var = bn(c_n, p.c_gammas, p.c_betas, pop_means_c, pop_vars_c, args)
+    #         h_n = dummy_h + o * self.activation(c_normal)
+
+
+    #         ## Zoneout
+    #         if args.zoneout:
+    #             h = h_n * drops + (1 - drops) * h
+    #             c = c_n * drops + (1 - drops) * c
+    #         else:
+    #             h = h_n
+    #             c = c_n
+
+    #         return (h, c, atilde, btilde, c_normal,
+    #                a_mean, b_mean, c_mean,
+    #                 a_var, b_var, c_var)
+
+
+    #     xtilde = T.dot(x, p.Wx)
+    #     if args.noise:
+    #         # prime h with white noise
+    #         Trng = MRG_RandomStreams()
+    #         h_prime = Trng.normal((xtilde.shape[1], args.num_hidden), std=args.noise)
+    #     elif args.summarize:
+    #         # prime h with mean of example
+    #         h_prime = x.mean(axis=[0, 2])[:, None]
+    #     else:
+    #         h_prime = 0
+
+    #     dummy_states = dict(h=T.zeros((xtilde.shape[0], xtilde.shape[1], args.num_hidden)),
+    #                         c=T.zeros((xtilde.shape[0], xtilde.shape[1], args.num_hidden)))
+
+    #     if popstats is None:
+    #         popstats = OrderedDict()
+    #         for key, size in zip("abc", [4*args.num_hidden, 4*args.num_hidden, args.num_hidden]):
+    #             for stat, init in zip("mean var".split(), [0, 1]):
+    #                 name = "%s_%s" % (key, stat)
+    #                 popstats[name] = theano.shared(
+    #                     init + np.zeros((length, size,), dtype=theano.config.floatX),
+    #                     name=name)
+    #     popstats_seq = [popstats['a_mean'], popstats['b_mean'], popstats['c_mean'],
+    #                     popstats['a_var'], popstats['b_var'], popstats['c_var']]
+
+    #     [h, c, atilde, btilde, htilde,
+    #      batch_mean_a, batch_mean_b, batch_mean_c,
+    #      batch_var_a, batch_var_b, batch_var_c ], _ = theano.scan(
+    #          stepfn,
+    #          sequences=[xtilde, drops, dummy_states["h"], dummy_states["c"]] + popstats_seq,
+    #          outputs_info=[T.repeat(p.h0[None, :], xtilde.shape[1], axis=0) + h_prime,
+    #                        T.repeat(p.c0[None, :], xtilde.shape[1], axis=0),
+    #                        None, None, None,
+    #                        None, None, None,
+    #                        None, None, None])
+
+    #     batchstats = OrderedDict()
+    #     batchstats['a_mean'] = batch_mean_a
+    #     batchstats['b_mean'] = batch_mean_b
+    #     batchstats['c_mean'] = batch_mean_c
+    #     batchstats['a_var'] = batch_var_a
+    #     batchstats['b_var'] = batch_var_b
+    #     batchstats['c_var'] = batch_var_c
+
+    #     updates = OrderedDict()
+    #     if not args.use_population_statistics:
+    #         alpha = 1e-2
+    #         for key in "abc":
+    #             for stat, init in zip("mean var".split(), [0, 1]):
+    #                 name = "%s_%s" % (key, stat)
+    #                 popstats[name].tag.estimand = batchstats[name]
+    #                 updates[popstats[name]] = (alpha * batchstats[name] +
+    #                                            (1 - alpha) * popstats[name])
+    #     return dict(h=h, c=c,
+    #                 atilde=atilde, btilde=btilde, htilde=htilde), updates, dummy_states, popstats
 
 
 def construct_common_graph(situation, args, outputs, dummy_states, Wy, by, y):
@@ -337,16 +463,23 @@ def construct_graphs(args, nclasses, length):
     by = theano.shared(np.zeros((nclasses,), dtype=theano.config.floatX), name="by")
 
     ### graph construction
-    inputs = dict(features=T.tensor3("x"), drop=T.tensor3('drops'), targets=T.ivector("y"))
-    x, drop, y = inputs["features"], inputs['drop'], inputs["targets"]
+    inputs = dict(features=T.tensor3("x"),
+                  drops_state=T.tensor3('drops_state'),
+                  drops_cell=T.tensor3('drops_cell'),
+                  targets=T.ivector("y"))
+    x, drops_state, drops_cell, y = inputs["features"], inputs['drops_state'], inputs['drops_cell'], inputs["targets"]
 
     theano.config.compute_test_value = "warn"
     batch = next(get_stream(which_set="train", batch_size=args.batch_size,
-                            drop_prob=args.drop_prob, for_evaluation=False,
+                            drop_prob_cell=args.drop_prob_cell,
+                            drop_prob_state=args.drop_prob_state,
+                            shared_mask=args.shared_mask,
+                            for_evaluation=False,
                             hidden_dim=args.num_hidden).get_epoch_iterator())
     x.tag.test_value = batch[0]
     y.tag.test_value = batch[1]
-    drop.tag.test_value = batch[2]
+    drops_state.tag.test_value = batch[2]
+    drops_cell.tag.test_value = batch[3]
 
 
     # x = x.reshape((x.shape[0], length + 0, 1))
@@ -359,11 +492,11 @@ def construct_graphs(args, nclasses, length):
 
     args.use_population_statistics = False
     turd = constructor(args, nclasses)
-    (outputs, training_updates, dummy_states, popstats) = turd.construct_graph_popstats(args, x, drop, length)
+    (outputs, training_updates, dummy_states, popstats) = turd.construct_graph_popstats(args, x, drops_state, drops_cell, length)
     training_graph, training_extensions = construct_common_graph("training", args, outputs, dummy_states, Wy, by, y)
 
     args.use_population_statistics = True
-    (inf_outputs, inference_updates, dummy_states, _) = turd.construct_graph_popstats(args, x, drop, length, popstats=popstats)
+    (inf_outputs, inference_updates, dummy_states, _) = turd.construct_graph_popstats(args, x, drops_state, drops_cell, length, popstats=popstats)
     inference_graph, inference_extensions = construct_common_graph("inference", args, inf_outputs, dummy_states, Wy, by, y)
 
     add_role(Wy, PARAMETER)
@@ -390,11 +523,13 @@ if __name__ == "__main__":
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--zoneout", action="store_true")
     parser.add_argument("--elephant", action="store_true")
-    parser.add_argument("--drop-prob", type=float, default=0.85)
+    parser.add_argument("--drop-prob_state", type=float, default=0.85)
+    parser.add_argument("--drop-prob_cell", type=float, default=0.85)
     parser.add_argument("--lstm", action="store_true")
     parser.add_argument("--initial-gamma", type=float, default=0.1)
     parser.add_argument("--initial-beta", type=float, default=0)
     parser.add_argument("--cluster", action="store_true")
+    parser.add_argument("--shared-mask", action="store_true")
     parser.add_argument("--activation", choices=list(activations.keys()), default="tanh")
     parser.add_argument("--init", type=str, default="ortho")
     parser.add_argument("--continue-from")
@@ -457,7 +592,10 @@ if __name__ == "__main__":
                 prefix="%s_%s" % (which_set, situation), after_epoch=True,
                 data_stream=get_stream(which_set=which_set, for_evaluation=True,
                                        batch_size=args.batch_size,
-                                       drop_prob=args.drop_prob, hidden_dim=args.num_hidden)))#, num_examples=1000)))
+                                       drop_prob_cell=args.drop_prob_cell,
+                                       drop_prob_state=args.drop_prob_state,
+                                       shared_mask = args.shared_mask,
+                                       hidden_dim=args.num_hidden)))#, num_examples=1000)))
     for situation in "inference".split(): # add inference
         for which_set in "valid test".split():
             logger.warning("constructing %s %s monitor" % (which_set, situation))
@@ -467,7 +605,10 @@ if __name__ == "__main__":
                 prefix="%s_%s" % (which_set, situation), after_epoch=True,
                 data_stream=get_stream(which_set=which_set, for_evaluation=True,
                                        batch_size=args.batch_size,
-                                       drop_prob=args.drop_prob, hidden_dim=args.num_hidden)))#, num_examples=1000)))
+                                       drop_prob_cell=args.drop_prob_cell,
+                                       drop_prob_state=args.drop_prob_state,
+                                       shared_mask = args.shared_mask,
+                                       hidden_dim=args.num_hidden)))#, num_examples=1000)))
 
     extensions.extend([
         TrackTheBest("valid_training_error_rate", "best_valid_training_error_rate"),
@@ -486,8 +627,13 @@ if __name__ == "__main__":
         PrintingTo("log"),
     ])
     train_stream = get_stream(which_set="train", for_evaluation=False,
-                               batch_size=args.batch_size,
-                               drop_prob=args.drop_prob, hidden_dim=args.num_hidden)
+                              batch_size=args.batch_size,
+                              drop_prob_cell=args.drop_prob_cell,
+                              drop_prob_state=args.drop_prob_state,
+                              shared_mask = args.shared_mask,
+                              hidden_dim=args.num_hidden)
+
+    import pdb; pdb.set_trace()
     main_loop = MainLoop(
         data_stream=train_stream,
         algorithm=algorithm, extensions=extensions, model=model)
